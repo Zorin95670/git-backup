@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BASE_DIR="/opt/git-backup"
+MIRROR_DIR="$BASE_DIR/mirrors"
+SNAPSHOT_DIR="$BASE_DIR/snapshots"
+LOG_DIR="$BASE_DIR/logs"
+CONFIG_FILE="$BASE_DIR/repos.txt"
+HASH_FILE="$SNAPSHOT_DIR/.last_hash"
+LOG_FILE="$LOG_DIR/git-backup.log"
+
+########################################
+# Logging
+########################################
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+########################################
+# Dependency helpers
+########################################
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "[ERROR] Missing dependency: $1"
+        exit 1
+    }
+}
+
+check_dependencies() {
+    for cmd in git tar zstd sha256sum sort awk find cp; do
+        require_cmd "$cmd"
+    done
+}
+
+check_init_state() {
+    [[ -d "$LOG_DIR" ]] || {
+        echo "[ERROR] Run 'git-backup init' first"
+        exit 1
+    }
+}
+
+########################################
+# Init
+########################################
+
+init() {
+    mkdir -p "$MIRROR_DIR" "$SNAPSHOT_DIR" "$LOG_DIR"
+    touch "$CONFIG_FILE"
+
+    log "[INIT] Creating directories..."
+    log "[OK] Base directory ready: $BASE_DIR"
+}
+
+########################################
+# Repo handling
+########################################
+
+repo_id() {
+    echo -n "$1" | sha256sum | awk '{print $1}'
+}
+
+repo_dir_name() {
+    local repo="$1"
+    local name="$(basename "$repo")"
+    echo "${name%.git}_$(repo_id "$repo").git"
+}
+
+########################################
+# Install mirrors
+########################################
+
+install_repos() {
+    [[ -f "$CONFIG_FILE" ]] || {
+        log "[ERROR] Missing config file"
+        exit 1
+    }
+
+    log "[INSTALL] Cloning mirrors..."
+
+    while IFS= read -r repo || [[ -n "$repo" ]]; do
+        [[ -z "$repo" ]] && continue
+        [[ "$repo" =~ ^# ]] && continue
+
+        dir_name="$(repo_dir_name "$repo")"
+        target="$MIRROR_DIR/$dir_name"
+
+        if [[ -d "$target" ]]; then
+            log "[SKIP] $repo already exists"
+            continue
+        fi
+
+        log "[CLONE] $repo -> $dir_name"
+        git clone --mirror "$repo" "$target"
+
+    done < "$CONFIG_FILE"
+
+    log "[DONE] Mirrors installed"
+}
+
+########################################
+# Update mirrors (FIXED glob)
+########################################
+
+update_mirrors() {
+    log "[UPDATE] Updating mirrors..."
+
+    for repo in "$MIRROR_DIR"/*.git; do
+        [[ ! -d "$repo" ]] && continue
+
+        log "  -> $(basename "$repo")"
+        git --git-dir="$repo" remote update --prune
+    done
+}
+
+########################################
+# Hash (stable)
+########################################
+
+compute_hash() {
+    find "$MIRROR_DIR" -type f -exec sha256sum {} \; 2>/dev/null \
+        | sort \
+        | sha256sum \
+        | awk '{print $1}'
+}
+
+########################################
+# Snapshot
+########################################
+
+create_snapshot() {
+    local name
+    name="$(date +"%Y-%m-%d_%H-%M-%S")"
+    local path="$SNAPSHOT_DIR/$name"
+
+    log "[SNAPSHOT] Creating $name"
+
+    mkdir -p "$path"
+    cp -al "$MIRROR_DIR"/. "$path"/
+
+    echo "$name"
+}
+
+########################################
+# Compression
+########################################
+
+compress_snapshots() {
+    local latest="$1"
+
+    log "[COMPRESS] Processing snapshots..."
+
+    for dir in "$SNAPSHOT_DIR"/*; do
+        [[ ! -d "$dir" ]] && continue
+
+        base="$(basename "$dir")"
+
+        [[ "$base" == "$latest" ]] && continue
+        [[ -f "$SNAPSHOT_DIR/$base.tar.zst" ]] && continue
+
+        log "  -> compressing $base"
+
+        tar --zstd -cf "$SNAPSHOT_DIR/$base.tar.zst" -C "$SNAPSHOT_DIR" "$base"
+        rm -rf "$dir"
+    done
+}
+
+########################################
+# Rotation (fixed cd isolation)
+########################################
+
+rotate() {
+    log "[ROTATE] Cleaning old snapshots..."
+
+    [[ -d "$SNAPSHOT_DIR" ]] || return
+
+    (
+        cd "$SNAPSHOT_DIR" || exit 0
+        ls -1t *.tar.zst 2>/dev/null | tail -n +6 | xargs -r rm -f
+    )
+}
+
+########################################
+# Execution
+########################################
+
+exec_backup() {
+    log "[RUN] Starting backup"
+
+    update_mirrors
+
+    current_hash="$(compute_hash)"
+
+    if [[ -f "$HASH_FILE" ]]; then
+        last_hash="$(cat "$HASH_FILE")"
+        if [[ "$current_hash" == "$last_hash" ]]; then
+            log "[SKIP] No changes detected"
+            exit 0
+        fi
+    fi
+
+    echo "$current_hash" > "$HASH_FILE"
+
+    latest="$(create_snapshot)"
+
+    compress_snapshots "$latest"
+    rotate
+
+    log "[DONE] Backup finished"
+}
+
+########################################
+# Main (fixed dependency logic)
+########################################
+
+main() {
+    case "${1:-}" in
+        init)
+            require_cmd mkdir
+            init
+            ;;
+
+        install)
+            check_init_state
+            check_dependencies
+            install_repos
+            ;;
+
+        exec)
+            check_init_state
+            check_dependencies
+            exec_backup
+            ;;
+
+        *)
+            echo "Usage: git-backup {init|install|exec}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
